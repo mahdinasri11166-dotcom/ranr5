@@ -70,7 +70,6 @@ jobs:
             "<html><body>GGUF Runner</body></html>" | Set-Content "web\index.html" -Encoding UTF8
           }
 
-      # ---------- Fix 2: llama-server pinned + size gate ----------
       - name: Download llama-server (pinned, min 1MB)
         shell: pwsh
         run: |
@@ -112,8 +111,10 @@ jobs:
             throw "Failed to download a valid llama-server (>=1MB). Build aborted to avoid shipping a broken binary."
           }
 
-      # ---------- Fix 3+4+5: offline Python embed + wheels + tkinter + project py ----------
-      - name: Build offline embedded Python
+      # =========================================================================
+      # FIXED STEP: Build offline Python with correct order (tkinter FIRST!)
+      # =========================================================================
+      - name: Build offline embedded Python (FIXED ORDER)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -123,7 +124,7 @@ jobs:
           if (Test-Path $offline) { Remove-Item -Recurse -Force $offline }
           New-Item -ItemType Directory -Force -Path $offline | Out-Null
 
-          # Embeddable Python 3.11.9
+          # 1) Download Embeddable Python 3.11.9
           $ver = "3.11.9"
           $zipName = "python-$ver-embed-amd64.zip"
           $zipPath = Join-Path $payload $zipName
@@ -134,7 +135,7 @@ jobs:
 
           Expand-Archive -Path $zipPath -DestinationPath $offline -Force
 
-          # Enable site-packages (Fix 4 related ._pth)
+          # 2) Enable site-packages in ._pth
           $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
           if (-not $pth) { throw "python*._pth not found" }
           @"
@@ -145,48 +146,8 @@ jobs:
           "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
           Write-Host "Patched $($pth.Name)"
 
-          $py = Join-Path $offline "python.exe"
-
-          # pip
-          & $py (Join-Path $payload "get-pip.py") --no-warn-script-location
-          if ($LASTEXITCODE -ne 0) { throw "get-pip failed" }
-          & $py -m pip install --upgrade pip wheel setuptools scikit-build-core --no-warn-script-location
-
-          # Core UI/deps
-          $pkgs = @("customtkinter", "requests", "pypdf", "Pillow", "numpy")
-          foreach ($pkg in $pkgs) {
-            Write-Host "pip install $pkg"
-            & $py -m pip install $pkg --no-warn-script-location
-            if ($LASTEXITCODE -ne 0) { throw "pip install $pkg failed" }
-          }
-
-          # Fix 3: llama-cpp-python CPU wheels from abetlen index
-          Write-Host "Installing llama-cpp-python (abetlen CPU wheels)..."
-          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF"
-          $llpOk = $false
-          try {
-            & $py -m pip install llama-cpp-python `
-              --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
-              --prefer-binary `
-              --no-warn-script-location
-            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
-          } catch {
-            Write-Host "abetlen strategy failed: $_"
-          }
-          if (-not $llpOk) {
-            Write-Host "Fallback: pip install llama-cpp-python with scikit-build-core"
-            & $py -m pip install "llama-cpp-python" --no-warn-script-location
-            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
-          }
-          if (-not $llpOk) { throw "llama-cpp-python install failed" }
-
-          & $py -c "import llama_cpp; print('llama_cpp OK')"
-          if ($LASTEXITCODE -ne 0) { throw "import llama_cpp failed" }
-          & $py -c "import customtkinter; print('customtkinter OK')"
-          if ($LASTEXITCODE -ne 0) { throw "import customtkinter failed" }
-
-          # Fix 4: full Python via choco for tkinter/tcl/tk copy
-          Write-Host "Installing python311 via choco for tkinter sources..."
+          # 3) INSTALL FULL PYTHON & COPY TKINTER (BEFORE installing packages!)
+          Write-Host "=== Installing full Python via Chocolatey for tkinter sources ==="
           choco install python311 -y --no-progress
           $sysPrefix = & "${env:ProgramFiles}\Python311\python.exe" -c "import sys; print(sys.base_prefix)" 2>$null
           if (-not $sysPrefix) {
@@ -227,23 +188,62 @@ jobs:
             Get-ChildItem $dllDir -Filter "_tkinter*" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
           }
 
-          # Verify tkinter with env vars
+          # 4) Set TCL/TK env vars and verify tkinter NOW
+          $py = Join-Path $offline "python.exe"
           $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
           $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
-          & $py -c "import tkinter; print('tkinter OK')"
-          if ($LASTEXITCODE -ne 0) { throw "tkinter import failed after copy" }
-          & $py -c "import customtkinter; print('customtkinter+tkinter OK')"
-          if ($LASTEXITCODE -ne 0) { throw "customtkinter still cannot load tkinter" }
+          Write-Host "TCL_LIBRARY=$env:TCL_LIBRARY"
+          Write-Host "TK_LIBRARY=$env:TK_LIBRARY"
 
-          # Fix 5: copy project *.py next to python.exe so config_loader resolves offline
+          & $py -c "import tkinter; print('tkinter OK (early check)')"
+          if ($LASTEXITCODE -ne 0) { throw "tkinter import failed BEFORE package install" }
+
+          # 5) NOW install pip and packages
+          & $py (Join-Path $payload "get-pip.py") --no-warn-script-location
+          if ($LASTEXITCODE -ne 0) { throw "get-pip failed" }
+          & $py -m pip install --upgrade pip wheel setuptools scikit-build-core --no-warn-script-location
+
+          $pkgs = @("customtkinter", "requests", "pypdf", "Pillow", "numpy")
+          foreach ($pkg in $pkgs) {
+            Write-Host "pip install $pkg"
+            & $py -m pip install $pkg --no-warn-script-location
+            if ($LASTEXITCODE -ne 0) { throw "pip install $pkg failed" }
+          }
+
+          # 6) Install llama-cpp-python
+          Write-Host "Installing llama-cpp-python (abetlen CPU wheels)..."
+          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF"
+          $llpOk = $false
+          try {
+            & $py -m pip install llama-cpp-python `
+              --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+              --prefer-binary `
+              --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
+          } catch {
+            Write-Host "abetlen strategy failed: $_"
+          }
+          if (-not $llpOk) {
+            Write-Host "Fallback: pip install llama-cpp-python with scikit-build-core"
+            & $py -m pip install "llama-cpp-python" --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
+          }
+          if (-not $llpOk) { throw "llama-cpp-python install failed" }
+
+          # 7) Final verification
+          & $py -c "import llama_cpp; print('llama_cpp OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import llama_cpp failed" }
+          & $py -c "import customtkinter; print('customtkinter OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import customtkinter failed" }
+
+          # 8) Copy project *.py
           Write-Host "Copying scripts/python/*.py into offline python root..."
           Copy-Item -Force "scripts\python\*.py" $offline
-          # Also keep scripts tree relative for normal CHAT.bat path
           $scriptsDst = Join-Path $offline "scripts\python"
           New-Item -ItemType Directory -Force -Path $scriptsDst | Out-Null
           Copy-Item -Force "scripts\python\*.py" $scriptsDst
 
-          # Smoke: config_loader import from offline cwd
+          # 9) Smoke test config_loader
           Push-Location $offline
           & $py -c "import sys; sys.path.insert(0, '.'); import config_loader; print('config_loader OK', config_loader.ROOT)"
           $cfgCode = $LASTEXITCODE
@@ -253,7 +253,6 @@ jobs:
           $sum = (Get-ChildItem $offline -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
           Write-Host ("Offline python bytes: {0:N0}" -f $sum)
           if ($sum -lt 10MB) { throw "offline python tree too small" }
-
 
       # ---------- Windows 7: Python 3.8 embed (api-ms-win-core-path safe) ----------
       - name: Build offline Python 3.8 for Windows 7
@@ -272,12 +271,7 @@ jobs:
           $url = "https://www.python.org/ftp/python/$ver/$zipName"
           Write-Host "Downloading $url (Win7)"
           Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
-          if (-not (Test-Path (Join-Path $payload "get-pip.py"))) {
-            Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.8/get-pip.py" -OutFile (Join-Path $payload "get-pip38.py") -UseBasicParsing
-          } else {
-            Copy-Item (Join-Path $payload "get-pip.py") (Join-Path $payload "get-pip38.py") -Force
-          }
-          # Prefer pip bootstrap for 3.8
+
           try {
             Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.8/get-pip.py" -OutFile (Join-Path $payload "get-pip38.py") -UseBasicParsing -TimeoutSec 120
           } catch {
@@ -348,7 +342,6 @@ jobs:
             if (Test-Path $dllDir) {
               Get-ChildItem $dllDir -Include "_tkinter*","tcl*","tk*","zlib*" -File -ErrorAction SilentlyContinue |
                 Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-              # older filter
               Get-ChildItem $dllDir -Filter "_tkinter*" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
               Get-ChildItem $dllDir -Filter "tcl*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
               Get-ChildItem $dllDir -Filter "tk*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
