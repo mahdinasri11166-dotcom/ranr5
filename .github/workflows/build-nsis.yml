@@ -124,7 +124,7 @@ jobs:
 
           Expand-Archive -Path $zipPath -DestinationPath $offline -Force
 
-          # 2) Enable site-packages AND Lib in ._pth
+          # 2) Enable site-packages, Lib, and DLLs in ._pth
           $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
           if (-not $pth) { throw "python*._pth not found" }
           @"
@@ -132,6 +132,7 @@ jobs:
           .
           Lib
           Lib\site-packages
+          DLLs
           import site
           "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
           Write-Host "Patched $($pth.Name)"
@@ -149,43 +150,38 @@ jobs:
           if (-not $sysPrefix) { throw "Full Python 3.11 not found after choco install" }
           Write-Host "sysPrefix=$sysPrefix"
 
-          $copies = @(
+          # Copy tcl/tk folders and tkinter package
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "tcl") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "Lib") | Out-Null
+          
+          $folderCopies = @(
             @{ Src = "tcl\tcl8.6"; Dst = "tcl\tcl8.6" },
             @{ Src = "tcl\tk8.6"; Dst = "tcl\tk8.6" },
-            @{ Src = "Lib\tkinter"; Dst = "Lib\tkinter" },
-            @{ Src = "DLLs\_tkinter.pyd"; Dst = "DLLs\_tkinter.pyd" },
-            @{ Src = "DLLs\tcl86t.dll"; Dst = "DLLs\tcl86t.dll" },
-            @{ Src = "DLLs\tk86t.dll"; Dst = "DLLs\tk86t.dll" },
-            @{ Src = "DLLs\zlib1.dll"; Dst = "DLLs\zlib1.dll" }
+            @{ Src = "Lib\tkinter"; Dst = "Lib\tkinter" }
           )
-          New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs") | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $offline "Lib") | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $offline "tcl") | Out-Null
-
-          foreach ($c in $copies) {
+          foreach ($c in $folderCopies) {
             $src = Join-Path $sysPrefix $c.Src
             $dst = Join-Path $offline $c.Dst
             if (Test-Path $src) {
-              $parent = Split-Path $dst -Parent
-              New-Item -ItemType Directory -Force -Path $parent | Out-Null
               Copy-Item -Recurse -Force $src $dst
               Write-Host "Copied $($c.Src)"
             } else {
               Write-Host "WARN missing $($c.Src)"
             }
           }
-          # Glob remaining tk/tcl DLLs
+
+          # Copy all critical .pyd and .dll files DIRECTLY next to python.exe
           $dllDir = Join-Path $sysPrefix "DLLs"
           if (Test-Path $dllDir) {
-            Get-ChildItem $dllDir -Filter "tcl*.dll" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-            Get-ChildItem $dllDir -Filter "tk*.dll" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-            Get-ChildItem $dllDir -Filter "_tkinter*" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+            # Copy _tkinter.pyd, tcl, tk, zlib DLLs
+            Get-ChildItem $dllDir -Include "_tkinter*.pyd", "tcl*.dll", "tk*.dll", "zlib*.dll" -File -ErrorAction SilentlyContinue |
+                Copy-Item -Force -Destination $offline
+            Write-Host "Copied DLLs next to python.exe"
           }
 
           # 4) Set TCL/TK env vars and verify tkinter NOW
           $py = Join-Path $offline "python.exe"
           
-          # FIX: Use absolute paths for TCL/TK
           $absoluteOffline = (Resolve-Path $offline).Path
           $env:TCL_LIBRARY = Join-Path $absoluteOffline "tcl\tcl8.6"
           $env:TK_LIBRARY = Join-Path $absoluteOffline "tcl\tk8.6"
