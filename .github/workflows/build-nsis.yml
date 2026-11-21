@@ -124,12 +124,13 @@ jobs:
 
           Expand-Archive -Path $zipPath -DestinationPath $offline -Force
 
-          # 2) Enable site-packages in ._pth
+          # 2) Enable site-packages AND Lib in ._pth
           $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
           if (-not $pth) { throw "python*._pth not found" }
           @"
           python311.zip
           .
+          Lib
           Lib\site-packages
           import site
           "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
