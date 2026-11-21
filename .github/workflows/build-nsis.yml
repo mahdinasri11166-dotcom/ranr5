@@ -244,9 +244,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $scriptsDst | Out-Null
           Copy-Item -Force "scripts\python\*.py" $scriptsDst
 
-          # 9) Smoke test config_loader
-          Push-Location $offline
-          & $py -c "import sys; sys.path.insert(0, '.'); import config_loader; print('config_loader OK', config_loader.ROOT)"
+          # 9) Smoke test config_loader - FIXED: Use root directory to avoid name conflicts
+          Write-Host "Testing config_loader import..."
+          # Set current location to the repository root (not installer)
+          Push-Location $root
+          $env:PYTHONPATH = Join-Path $root "scripts\python"
+          & $py -c "import sys; sys.path.insert(0, 'scripts/python'); import config_loader; print('config_loader OK', config_loader.ROOT)"
           $cfgCode = $LASTEXITCODE
           Pop-Location
           if ($cfgCode -ne 0) { throw "config_loader import failed in offline python tree" }
