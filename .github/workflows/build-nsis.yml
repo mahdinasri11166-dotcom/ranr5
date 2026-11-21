@@ -153,6 +153,7 @@ jobs:
           # Copy tcl/tk folders and tkinter package
           New-Item -ItemType Directory -Force -Path (Join-Path $offline "tcl") | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $offline "Lib") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs") | Out-Null
           
           $folderCopies = @(
             @{ Src = "tcl\tcl8.6"; Dst = "tcl\tcl8.6" },
@@ -170,13 +171,20 @@ jobs:
             }
           }
 
-          # Copy all critical .pyd and .dll files DIRECTLY next to python.exe
+          # Copy all critical .pyd and .dll files DIRECTLY next to python.exe AND into DLLs folder
           $dllDir = Join-Path $sysPrefix "DLLs"
           if (Test-Path $dllDir) {
-            # Copy _tkinter.pyd, tcl, tk, zlib DLLs
-            Get-ChildItem $dllDir -Include "_tkinter*.pyd", "tcl*.dll", "tk*.dll", "zlib*.dll" -File -ErrorAction SilentlyContinue |
-                Copy-Item -Force -Destination $offline
-            Write-Host "Copied DLLs next to python.exe"
+            $criticalFiles = @("_tkinter.pyd", "tcl86t.dll", "tk86t.dll", "zlib1.dll")
+            foreach ($f in $criticalFiles) {
+              $src = Join-Path $dllDir $f
+              if (Test-Path $src) {
+                Copy-Item -Force $src -Destination $offline
+                Copy-Item -Force $src -Destination (Join-Path $offline "DLLs")
+                Write-Host "Copied $f"
+              } else {
+                Write-Host "WARN missing $f"
+              }
+            }
           }
 
           # 4) Set TCL/TK env vars and verify tkinter NOW
