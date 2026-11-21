@@ -139,7 +139,6 @@ jobs:
           Write-Host "=== Installing full Python via Chocolatey for tkinter sources ==="
           choco install python311 -y --no-progress
           
-          # FIX: Find the actual python prefix dynamically
           $sysPrefix = & python -c "import sys; print(sys.base_prefix)"
           if (-not $sysPrefix) {
               foreach ($cand in @("C:\Python311", "$env:ProgramFiles\Python311", "$env:LocalAppData\Programs\Python\Python311")) {
@@ -184,8 +183,11 @@ jobs:
 
           # 4) Set TCL/TK env vars and verify tkinter NOW
           $py = Join-Path $offline "python.exe"
-          $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
-          $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
+          
+          # FIX: Use absolute paths for TCL/TK
+          $absoluteOffline = (Resolve-Path $offline).Path
+          $env:TCL_LIBRARY = Join-Path $absoluteOffline "tcl\tcl8.6"
+          $env:TK_LIBRARY = Join-Path $absoluteOffline "tcl\tk8.6"
           Write-Host "TCL_LIBRARY=$env:TCL_LIBRARY"
           Write-Host "TK_LIBRARY=$env:TK_LIBRARY"
 
