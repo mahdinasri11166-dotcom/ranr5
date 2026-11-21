@@ -1,0 +1,437 @@
+name: Build NSIS Setup EXE (Offline-ready)
+
+# Fixes baked in from production CI failures:
+# 1) Clean YAML indentation
+# 2) llama-server pinned b8581 + reject files < 1MB
+# 3) llama-cpp-python from abetlen CPU wheels (+ scikit-build-core)
+# 4) Copy tkinter/tcl/tk from full Python into embed tree
+# 5) Ship project *.py next to offline python.exe (config_loader import)
+# Team: Mehdi Tariri · Mohsen Tarifii
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nsis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nsis:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11 (selftest)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Selftest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          python -m pip install numpy requests pypdf Pillow --quiet
+          $env:PYTHONPATH = Join-Path $pwd "scripts\python"
+          python scripts\python\selftest.py
+          if ($LASTEXITCODE -ne 0) { throw "selftest failed" }
+
+      - name: Ensure required files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $need = @(
+            "CHAT.bat", "SETUP.bat", "START.bat", "FirstRun.bat",
+            "LICENSE", "README.md",
+            "installer\GGUF-Runner.nsi",
+            "scripts\python\app_hub.py",
+            "scripts\python\agent_tools.py",
+            "scripts\python\config_loader.py"
+          )
+          foreach ($f in $need) {
+            if (-not (Test-Path $f)) { throw "Missing required file: $f" }
+          }
+          foreach ($d in @("models", "bin", "books", "memory", "dataset", "sessions", "workspace", "profiles", "web", "docs")) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
+          if (-not (Test-Path "models\README.txt")) {
+            "Place .gguf model files in this folder." | Set-Content "models\README.txt" -Encoding UTF8
+          }
+          if (-not (Test-Path "web\index.html")) {
+            "<html><body>GGUF Runner</body></html>" | Set-Content "web\index.html" -Encoding UTF8
+          }
+
+      # ---------- Fix 2: llama-server pinned + size gate ----------
+      - name: Download llama-server (pinned, min 1MB)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path bin, bin\_tmp | Out-Null
+          $candidates = @(
+            "https://github.com/ggml-org/llama.cpp/releases/download/b8581/llama-b8581-bin-win-cpu-x64.zip",
+            "https://github.com/ggerganov/llama.cpp/releases/download/b8581/llama-b8581-bin-win-cpu-x64.zip"
+          )
+          $zip = "bin\_tmp\llama.zip"
+          $ok = $false
+          foreach ($url in $candidates) {
+            try {
+              Write-Host "Trying $url"
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300
+              $sz = (Get-Item $zip).Length
+              Write-Host "Downloaded $sz bytes"
+              if ($sz -lt 1MB) { throw "file too small ($sz) — rejecting corrupt download" }
+              if (Test-Path "bin\_tmp\out") { Remove-Item -Recurse -Force "bin\_tmp\out" }
+              Expand-Archive -Path $zip -DestinationPath "bin\_tmp\out" -Force
+              $exe = Get-ChildItem "bin\_tmp\out" -Recurse -Filter "llama-server.exe" | Select-Object -First 1
+              if (-not $exe) {
+                $exe = Get-ChildItem "bin\_tmp\out" -Recurse -Filter "server.exe" | Select-Object -First 1
+              }
+              if (-not $exe) { throw "llama-server.exe not found in archive" }
+              $exeSz = $exe.Length
+              if ($exeSz -lt 1MB) { throw "llama-server.exe too small ($exeSz)" }
+              Copy-Item -Force $exe.FullName "bin\llama-server.exe"
+              Get-ChildItem $exe.Directory.FullName -Filter "*.dll" -ErrorAction SilentlyContinue |
+                Copy-Item -Force -Destination bin
+              Write-Host "OK llama-server.exe size=$exeSz"
+              $ok = $true
+              break
+            } catch {
+              Write-Host "Candidate failed: $_"
+            }
+          }
+          if (-not $ok) {
+            throw "Failed to download a valid llama-server (>=1MB). Build aborted to avoid shipping a broken binary."
+          }
+
+      # ---------- Fix 3+4+5: offline Python embed + wheels + tkinter + project py ----------
+      - name: Build offline embedded Python
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = "installer\payload"
+          $offline = "installer\payload\python-offline-amd64"
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          if (Test-Path $offline) { Remove-Item -Recurse -Force $offline }
+          New-Item -ItemType Directory -Force -Path $offline | Out-Null
+
+          # Embeddable Python 3.11.9
+          $ver = "3.11.9"
+          $zipName = "python-$ver-embed-amd64.zip"
+          $zipPath = Join-Path $payload $zipName
+          $url = "https://www.python.org/ftp/python/$ver/$zipName"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile (Join-Path $payload "get-pip.py") -UseBasicParsing -TimeoutSec 120
+
+          Expand-Archive -Path $zipPath -DestinationPath $offline -Force
+
+          # Enable site-packages (Fix 4 related ._pth)
+          $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
+          if (-not $pth) { throw "python*._pth not found" }
+          @"
+          python311.zip
+          .
+          Lib\site-packages
+          import site
+          "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
+          Write-Host "Patched $($pth.Name)"
+
+          $py = Join-Path $offline "python.exe"
+
+          # pip
+          & $py (Join-Path $payload "get-pip.py") --no-warn-script-location
+          if ($LASTEXITCODE -ne 0) { throw "get-pip failed" }
+          & $py -m pip install --upgrade pip wheel setuptools scikit-build-core --no-warn-script-location
+
+          # Core UI/deps
+          $pkgs = @("customtkinter", "requests", "pypdf", "Pillow", "numpy")
+          foreach ($pkg in $pkgs) {
+            Write-Host "pip install $pkg"
+            & $py -m pip install $pkg --no-warn-script-location
+            if ($LASTEXITCODE -ne 0) { throw "pip install $pkg failed" }
+          }
+
+          # Fix 3: llama-cpp-python CPU wheels from abetlen index
+          Write-Host "Installing llama-cpp-python (abetlen CPU wheels)..."
+          $env:CMAKE_ARGS = "-DGGML_NATIVE=OFF"
+          $llpOk = $false
+          try {
+            & $py -m pip install llama-cpp-python `
+              --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+              --prefer-binary `
+              --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
+          } catch {
+            Write-Host "abetlen strategy failed: $_"
+          }
+          if (-not $llpOk) {
+            Write-Host "Fallback: pip install llama-cpp-python with scikit-build-core"
+            & $py -m pip install "llama-cpp-python" --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llpOk = $true }
+          }
+          if (-not $llpOk) { throw "llama-cpp-python install failed" }
+
+          & $py -c "import llama_cpp; print('llama_cpp OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import llama_cpp failed" }
+          & $py -c "import customtkinter; print('customtkinter OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import customtkinter failed" }
+
+          # Fix 4: full Python via choco for tkinter/tcl/tk copy
+          Write-Host "Installing python311 via choco for tkinter sources..."
+          choco install python311 -y --no-progress
+          $sysPrefix = & "${env:ProgramFiles}\Python311\python.exe" -c "import sys; print(sys.base_prefix)" 2>$null
+          if (-not $sysPrefix) {
+            $sysPrefix = & python -c "import sys; print(sys.base_prefix)"
+          }
+          Write-Host "sysPrefix=$sysPrefix"
+
+          $copies = @(
+            @{ Src = "tcl\tcl8.6"; Dst = "tcl\tcl8.6" },
+            @{ Src = "tcl\tk8.6"; Dst = "tcl\tk8.6" },
+            @{ Src = "Lib\tkinter"; Dst = "Lib\tkinter" },
+            @{ Src = "DLLs\_tkinter.pyd"; Dst = "DLLs\_tkinter.pyd" },
+            @{ Src = "DLLs\tcl86t.dll"; Dst = "DLLs\tcl86t.dll" },
+            @{ Src = "DLLs\tk86t.dll"; Dst = "DLLs\tk86t.dll" },
+            @{ Src = "DLLs\zlib1.dll"; Dst = "DLLs\zlib1.dll" }
+          )
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "Lib") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "tcl") | Out-Null
+
+          foreach ($c in $copies) {
+            $src = Join-Path $sysPrefix $c.Src
+            $dst = Join-Path $offline $c.Dst
+            if (Test-Path $src) {
+              $parent = Split-Path $dst -Parent
+              New-Item -ItemType Directory -Force -Path $parent | Out-Null
+              Copy-Item -Recurse -Force $src $dst
+              Write-Host "Copied $($c.Src)"
+            } else {
+              Write-Host "WARN missing $($c.Src)"
+            }
+          }
+          # Glob remaining tk/tcl DLLs
+          $dllDir = Join-Path $sysPrefix "DLLs"
+          if (Test-Path $dllDir) {
+            Get-ChildItem $dllDir -Filter "tcl*.dll" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+            Get-ChildItem $dllDir -Filter "tk*.dll" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+            Get-ChildItem $dllDir -Filter "_tkinter*" -ErrorAction SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+          }
+
+          # Verify tkinter with env vars
+          $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
+          $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
+          & $py -c "import tkinter; print('tkinter OK')"
+          if ($LASTEXITCODE -ne 0) { throw "tkinter import failed after copy" }
+          & $py -c "import customtkinter; print('customtkinter+tkinter OK')"
+          if ($LASTEXITCODE -ne 0) { throw "customtkinter still cannot load tkinter" }
+
+          # Fix 5: copy project *.py next to python.exe so config_loader resolves offline
+          Write-Host "Copying scripts/python/*.py into offline python root..."
+          Copy-Item -Force "scripts\python\*.py" $offline
+          # Also keep scripts tree relative for normal CHAT.bat path
+          $scriptsDst = Join-Path $offline "scripts\python"
+          New-Item -ItemType Directory -Force -Path $scriptsDst | Out-Null
+          Copy-Item -Force "scripts\python\*.py" $scriptsDst
+
+          # Smoke: config_loader import from offline cwd
+          Push-Location $offline
+          & $py -c "import sys; sys.path.insert(0, '.'); import config_loader; print('config_loader OK', config_loader.ROOT)"
+          $cfgCode = $LASTEXITCODE
+          Pop-Location
+          if ($cfgCode -ne 0) { throw "config_loader import failed in offline python tree" }
+
+          $sum = (Get-ChildItem $offline -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          Write-Host ("Offline python bytes: {0:N0}" -f $sum)
+          if ($sum -lt 10MB) { throw "offline python tree too small" }
+
+
+      # ---------- Windows 7: Python 3.8 embed (api-ms-win-core-path safe) ----------
+      - name: Build offline Python 3.8 for Windows 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = "installer\payload"
+          $offline = "installer\payload\python-offline-win7-amd64"
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          if (Test-Path $offline) { Remove-Item -Recurse -Force $offline }
+          New-Item -ItemType Directory -Force -Path $offline | Out-Null
+
+          $ver = "3.8.10"
+          $zipName = "python-$ver-embed-amd64.zip"
+          $zipPath = Join-Path $payload $zipName
+          $url = "https://www.python.org/ftp/python/$ver/$zipName"
+          Write-Host "Downloading $url (Win7)"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
+          if (-not (Test-Path (Join-Path $payload "get-pip.py"))) {
+            Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.8/get-pip.py" -OutFile (Join-Path $payload "get-pip38.py") -UseBasicParsing
+          } else {
+            Copy-Item (Join-Path $payload "get-pip.py") (Join-Path $payload "get-pip38.py") -Force
+          }
+          # Prefer pip bootstrap for 3.8
+          try {
+            Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.8/get-pip.py" -OutFile (Join-Path $payload "get-pip38.py") -UseBasicParsing -TimeoutSec 120
+          } catch {
+            Copy-Item (Join-Path $payload "get-pip.py") (Join-Path $payload "get-pip38.py") -Force
+          }
+
+          Expand-Archive -Path $zipPath -DestinationPath $offline -Force
+          $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
+          if (-not $pth) { throw "python38 ._pth missing" }
+          @"
+          python38.zip
+          .
+          Lib\site-packages
+          import site
+          "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
+
+          $py = Join-Path $offline "python.exe"
+          & $py (Join-Path $payload "get-pip38.py") --no-warn-script-location
+          if ($LASTEXITCODE -ne 0) { throw "get-pip 3.8 failed" }
+          & $py -m pip install --upgrade pip wheel setuptools --no-warn-script-location
+
+          foreach ($pkg in @("customtkinter", "requests", "pypdf", "Pillow", "numpy")) {
+            Write-Host "py38 pip install $pkg"
+            & $py -m pip install $pkg --no-warn-script-location
+            if ($LASTEXITCODE -ne 0) { throw "py38 pip $pkg failed" }
+          }
+
+          Write-Host "py38 llama-cpp-python..."
+          $llp = $false
+          try {
+            & $py -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --prefer-binary --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llp = $true }
+          } catch { Write-Host $_ }
+          if (-not $llp) {
+            & $py -m pip install llama-cpp-python --no-warn-script-location
+            if ($LASTEXITCODE -eq 0) { $llp = $true }
+          }
+          if (-not $llp) { Write-Host "WARN py38 llama-cpp-python failed — Win7 users may need manual wheel" }
+          else { & $py -c "import llama_cpp; print('py38 llama_cpp OK')" }
+
+          # tkinter from system python if 3.8 available, else from choco python
+          $sysPrefix = $null
+          foreach ($cand in @(
+            "${env:ProgramFiles}\Python38",
+            "${env:ProgramFiles(x86)}\Python38-32",
+            "${env:LocalAppData}\Programs\Python\Python38"
+          )) {
+            if (Test-Path "$cand\python.exe") { $sysPrefix = $cand; break }
+          }
+          if (-not $sysPrefix) {
+            choco install python38 -y --no-progress
+            if (Test-Path "${env:ProgramFiles}\Python38\python.exe") {
+              $sysPrefix = "${env:ProgramFiles}\Python38"
+            }
+          }
+          if ($sysPrefix) {
+            Write-Host "Copying tkinter from $sysPrefix"
+            New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs"), (Join-Path $offline "Lib"), (Join-Path $offline "tcl") | Out-Null
+            foreach ($rel in @("Lib\tkinter", "tcl\tcl8.6", "tcl\tk8.6")) {
+              $s = Join-Path $sysPrefix $rel
+              if (Test-Path $s) {
+                $d = Join-Path $offline $rel
+                New-Item -ItemType Directory -Force -Path (Split-Path $d) | Out-Null
+                Copy-Item -Recurse -Force $s $d
+              }
+            }
+            $dllDir = Join-Path $sysPrefix "DLLs"
+            if (Test-Path $dllDir) {
+              Get-ChildItem $dllDir -Include "_tkinter*","tcl*","tk*","zlib*" -File -ErrorAction SilentlyContinue |
+                Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+              # older filter
+              Get-ChildItem $dllDir -Filter "_tkinter*" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+              Get-ChildItem $dllDir -Filter "tcl*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+              Get-ChildItem $dllDir -Filter "tk*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
+            }
+            $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
+            $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
+            & $py -c "import tkinter; print('py38 tkinter OK')"
+          } else {
+            Write-Host "WARN no Python 3.8 full install for tkinter copy"
+          }
+
+          Copy-Item -Force "scripts\python\*.py" $offline
+          $scriptsDst = Join-Path $offline "scripts\python"
+          New-Item -ItemType Directory -Force -Path $scriptsDst | Out-Null
+          Copy-Item -Force "scripts\python\*.py" $scriptsDst
+
+          $sum = (Get-ChildItem $offline -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum
+          Write-Host ("Win7 offline python bytes: {0:N0}" -f $sum)
+          if ($sum -lt 5MB) { throw "Win7 python tree too small" }
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install nsis -y --no-progress
+          $makensis = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { throw "makensis not found" }
+          echo "MAKENSIS=$makensis" >> $env:GITHUB_ENV
+          Write-Host "Using $makensis"
+
+      - name: Soften NSIS icon if missing
+        shell: pwsh
+        run: |
+          $nsi = "installer\GGUF-Runner.nsi"
+          $ico = "installer\assets\app.ico"
+          if (-not (Test-Path $ico)) {
+            $raw = Get-Content $nsi -Raw
+            $raw = $raw -replace '(?m)^!define MUI_ICON.*\r?\n', ''
+            $raw = $raw -replace '(?m)^!define MUI_UNICON.*\r?\n', ''
+            Set-Content $nsi -Value $raw -Encoding UTF8
+          }
+
+      - name: Compile NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path installer\Output | Out-Null
+          if (-not (Test-Path "installer\payload\python-offline-amd64\python.exe")) {
+            throw "offline python missing before NSIS"
+          }
+          if (-not (Test-Path "bin\llama-server.exe")) {
+            throw "llama-server.exe missing before NSIS"
+          }
+          Push-Location installer
+          & "$env:MAKENSIS" /V2 GGUF-Runner.nsi
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "makensis failed: $code" }
+          $exe = Get-ChildItem installer\Output\GGUF-Runner-Setup-*.exe | Select-Object -First 1
+          if (-not $exe) { throw "No Setup EXE produced" }
+          if ($exe.Length -lt 5MB) { throw "Setup EXE too small ($($exe.Length)) — offline payload missing?" }
+          Write-Host "BUILT $($exe.Name) size=$($exe.Length)"
+
+      - name: Upload Setup EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: GGUF-Runner-NSIS-Setup
+          path: installer/Output/GGUF-Runner-Setup-*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/Output/GGUF-Runner-Setup-*.exe
+          generate_release_notes: true
+          body: |
+            Offline-oriented Setup EXE.
+            After install: put `.gguf` files in `models\`, run desktop shortcut / CHAT.bat.
+            Team: Mehdi Tariri · Mohsen Tarifii
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
