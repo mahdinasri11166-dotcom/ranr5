@@ -1,13 +1,5 @@
 name: Build NSIS Setup EXE (Offline-ready)
 
-# Fixes baked in from production CI failures:
-# 1) Clean YAML indentation
-# 2) llama-server pinned b8581 + reject files < 1MB
-# 3) llama-cpp-python from abetlen CPU wheels (+ scikit-build-core)
-# 4) Copy tkinter/tcl/tk from full Python into embed tree
-# 5) Ship project *.py next to offline python.exe (config_loader import)
-# Team: Mehdi Tariri · Mohsen Tarifii
-
 on:
   push:
     tags:
@@ -111,9 +103,6 @@ jobs:
             throw "Failed to download a valid llama-server (>=1MB). Build aborted to avoid shipping a broken binary."
           }
 
-      # =========================================================================
-      # FIXED STEP: Build offline Python with correct order (tkinter FIRST!)
-      # =========================================================================
       - name: Build offline embedded Python (FIXED ORDER)
         shell: pwsh
         run: |
@@ -146,13 +135,18 @@ jobs:
           "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
           Write-Host "Patched $($pth.Name)"
 
-          # 3) INSTALL FULL PYTHON & COPY TKINTER (BEFORE installing packages!)
+          # 3) INSTALL FULL PYTHON & COPY TKINTER
           Write-Host "=== Installing full Python via Chocolatey for tkinter sources ==="
           choco install python311 -y --no-progress
-          $sysPrefix = & "${env:ProgramFiles}\Python311\python.exe" -c "import sys; print(sys.base_prefix)" 2>$null
+          
+          # FIX: Find the actual python prefix dynamically
+          $sysPrefix = & python -c "import sys; print(sys.base_prefix)"
           if (-not $sysPrefix) {
-            $sysPrefix = & python -c "import sys; print(sys.base_prefix)"
+              foreach ($cand in @("C:\Python311", "$env:ProgramFiles\Python311", "$env:LocalAppData\Programs\Python\Python311")) {
+                  if (Test-Path "$cand\python.exe") { $sysPrefix = $cand; break }
+              }
           }
+          if (-not $sysPrefix) { throw "Full Python 3.11 not found after choco install" }
           Write-Host "sysPrefix=$sysPrefix"
 
           $copies = @(
@@ -253,114 +247,6 @@ jobs:
           $sum = (Get-ChildItem $offline -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
           Write-Host ("Offline python bytes: {0:N0}" -f $sum)
           if ($sum -lt 10MB) { throw "offline python tree too small" }
-
-      # ---------- Windows 7: Python 3.8 embed (api-ms-win-core-path safe) ----------
-      - name: Build offline Python 3.8 for Windows 7
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $payload = "installer\payload"
-          $offline = "installer\payload\python-offline-win7-amd64"
-          New-Item -ItemType Directory -Force -Path $payload | Out-Null
-          if (Test-Path $offline) { Remove-Item -Recurse -Force $offline }
-          New-Item -ItemType Directory -Force -Path $offline | Out-Null
-
-          $ver = "3.8.10"
-          $zipName = "python-$ver-embed-amd64.zip"
-          $zipPath = Join-Path $payload $zipName
-          $url = "https://www.python.org/ftp/python/$ver/$zipName"
-          Write-Host "Downloading $url (Win7)"
-          Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
-
-          try {
-            Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/3.8/get-pip.py" -OutFile (Join-Path $payload "get-pip38.py") -UseBasicParsing -TimeoutSec 120
-          } catch {
-            Copy-Item (Join-Path $payload "get-pip.py") (Join-Path $payload "get-pip38.py") -Force
-          }
-
-          Expand-Archive -Path $zipPath -DestinationPath $offline -Force
-          $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
-          if (-not $pth) { throw "python38 ._pth missing" }
-          @"
-          python38.zip
-          .
-          Lib\site-packages
-          import site
-          "@ -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Set-Content $pth.FullName -Encoding ASCII
-
-          $py = Join-Path $offline "python.exe"
-          & $py (Join-Path $payload "get-pip38.py") --no-warn-script-location
-          if ($LASTEXITCODE -ne 0) { throw "get-pip 3.8 failed" }
-          & $py -m pip install --upgrade pip wheel setuptools --no-warn-script-location
-
-          foreach ($pkg in @("customtkinter", "requests", "pypdf", "Pillow", "numpy")) {
-            Write-Host "py38 pip install $pkg"
-            & $py -m pip install $pkg --no-warn-script-location
-            if ($LASTEXITCODE -ne 0) { throw "py38 pip $pkg failed" }
-          }
-
-          Write-Host "py38 llama-cpp-python..."
-          $llp = $false
-          try {
-            & $py -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --prefer-binary --no-warn-script-location
-            if ($LASTEXITCODE -eq 0) { $llp = $true }
-          } catch { Write-Host $_ }
-          if (-not $llp) {
-            & $py -m pip install llama-cpp-python --no-warn-script-location
-            if ($LASTEXITCODE -eq 0) { $llp = $true }
-          }
-          if (-not $llp) { Write-Host "WARN py38 llama-cpp-python failed — Win7 users may need manual wheel" }
-          else { & $py -c "import llama_cpp; print('py38 llama_cpp OK')" }
-
-          # tkinter from system python if 3.8 available, else from choco python
-          $sysPrefix = $null
-          foreach ($cand in @(
-            "${env:ProgramFiles}\Python38",
-            "${env:ProgramFiles(x86)}\Python38-32",
-            "${env:LocalAppData}\Programs\Python\Python38"
-          )) {
-            if (Test-Path "$cand\python.exe") { $sysPrefix = $cand; break }
-          }
-          if (-not $sysPrefix) {
-            choco install python38 -y --no-progress
-            if (Test-Path "${env:ProgramFiles}\Python38\python.exe") {
-              $sysPrefix = "${env:ProgramFiles}\Python38"
-            }
-          }
-          if ($sysPrefix) {
-            Write-Host "Copying tkinter from $sysPrefix"
-            New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs"), (Join-Path $offline "Lib"), (Join-Path $offline "tcl") | Out-Null
-            foreach ($rel in @("Lib\tkinter", "tcl\tcl8.6", "tcl\tk8.6")) {
-              $s = Join-Path $sysPrefix $rel
-              if (Test-Path $s) {
-                $d = Join-Path $offline $rel
-                New-Item -ItemType Directory -Force -Path (Split-Path $d) | Out-Null
-                Copy-Item -Recurse -Force $s $d
-              }
-            }
-            $dllDir = Join-Path $sysPrefix "DLLs"
-            if (Test-Path $dllDir) {
-              Get-ChildItem $dllDir -Include "_tkinter*","tcl*","tk*","zlib*" -File -ErrorAction SilentlyContinue |
-                Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-              Get-ChildItem $dllDir -Filter "_tkinter*" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-              Get-ChildItem $dllDir -Filter "tcl*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-              Get-ChildItem $dllDir -Filter "tk*.dll" -EA SilentlyContinue | Copy-Item -Force -Destination (Join-Path $offline "DLLs")
-            }
-            $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
-            $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
-            & $py -c "import tkinter; print('py38 tkinter OK')"
-          } else {
-            Write-Host "WARN no Python 3.8 full install for tkinter copy"
-          }
-
-          Copy-Item -Force "scripts\python\*.py" $offline
-          $scriptsDst = Join-Path $offline "scripts\python"
-          New-Item -ItemType Directory -Force -Path $scriptsDst | Out-Null
-          Copy-Item -Force "scripts\python\*.py" $scriptsDst
-
-          $sum = (Get-ChildItem $offline -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum
-          Write-Host ("Win7 offline python bytes: {0:N0}" -f $sum)
-          if ($sum -lt 5MB) { throw "Win7 python tree too small" }
 
       - name: Install NSIS
         shell: pwsh
