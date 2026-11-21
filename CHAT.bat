@@ -4,11 +4,6 @@ title GGUF Runner Hub
 cd /d "%~dp0"
 set "GGUF_ROOT=%~dp0"
 if "%GGUF_ROOT:~-1%"=="\" set "GGUF_ROOT=%GGUF_ROOT:~0,-1%"
-call "%~dp0scripts\env_python.bat" 2>nul
-
-if not exist "models" mkdir models 2>nul
-if not exist "sessions" mkdir sessions 2>nul
-if not exist "workspace" mkdir workspace 2>nul
 
 REM OS class:
 REM   LEGACY = Win7 (6.1) / Win8.0 (6.2) → Python 3.8
@@ -18,19 +13,36 @@ ver | findstr /I "6.1." >nul && set "GGUF_LEGACY=1"
 ver | findstr /I "6.2." >nul && set "GGUF_LEGACY=1"
 
 set "PY="
+set "PY_DIR="
+
 if defined GGUF_LEGACY (
-  if exist "%~dp0python38\python.exe" set "PY=%~dp0python38\python.exe"
-  if not defined PY if exist "%~dp0python\python.exe" set "PY=%~dp0python\python.exe"
+  if exist "%~dp0python38\python.exe" (
+    set "PY=%~dp0python38\python.exe"
+    set "PY_DIR=%~dp0python38"
+  )
+  if not defined PY if exist "%~dp0python\python.exe" (
+    set "PY=%~dp0python\python.exe"
+    set "PY_DIR=%~dp0python"
+  )
   echo [INFO] Legacy Windows ^(7 / 8.0^) — Python 3.8 preferred
 ) else (
-  if exist "%~dp0python\python.exe" set "PY=%~dp0python\python.exe"
-  if not defined PY if exist "%~dp0python38\python.exe" set "PY=%~dp0python38\python.exe"
+  if exist "%~dp0python\python.exe" (
+    set "PY=%~dp0python\python.exe"
+    set "PY_DIR=%~dp0python"
+  )
+  if not defined PY if exist "%~dp0python38\python.exe" (
+    set "PY=%~dp0python38\python.exe"
+    set "PY_DIR=%~dp0python38"
+  )
   echo [INFO] Modern Windows ^(8.1 / 10 / 11^) — Python 3.11 preferred
 )
 
 if not defined PY (
   where python >nul 2>&1 && for /f "delims=" %%P in ('where python') do (
-    if not defined PY set "PY=%%P"
+    if not defined PY (
+      set "PY=%%P"
+      for %%D in ("%%~dpP.") do set "PY_DIR=%%~fD"
+    )
   )
 )
 
@@ -50,9 +62,18 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM --- تنظیم متغیرهای محیطی TCL/TK برای رابط گرافیکی ---
+if defined PY_DIR (
+    if exist "%PY_DIR%\tcl\tcl8.6" set "TCL_LIBRARY=%PY_DIR%\tcl\tcl8.6"
+    if exist "%PY_DIR%\tcl\tk8.6" set "TK_LIBRARY=%PY_DIR%\tcl\tk8.6"
+    REM تنظیم PYTHONPATH برای پیدا کردن فایل‌های پروژه
+    set "PYTHONPATH=%PY_DIR%;%~dp0scripts\python"
+)
+
 "%PY%" -c "import customtkinter" 2>nul
 if errorlevel 1 (
-  echo [ERROR] customtkinter/tkinter موجود نیست. Setup کامل GitHub را نصب کنید.
+  echo [ERROR] customtkinter/tkinter موجود نیست.
+  echo       لطفا Setup کامل GitHub را نصب کنید یا مطمئن شوید فایل‌های tcl کپی شده‌اند.
   pause
   exit /b 1
 )
